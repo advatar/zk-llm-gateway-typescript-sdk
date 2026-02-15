@@ -1,0 +1,57 @@
+{
+  "name": "zk-llm-gateway-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for ZK LLM Gateway: encrypted envelopes, token-class padding, and ZK-ready usage tickets.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/zk-llm-gateway-typescript-sdk.git"
+  },
+  "homepage": "https://github.com/your-org/zk-llm-gateway-typescript-sdk",
+  "bugs": {
+    "url": "https://github.com/your-org/zk-llm-gateway-typescript-sdk/issues"
+  },
+  "keywords": [
+    "zk",
+    "privacy",
+    "llm",
+    "gateway",
+    "crypto",
+    "chacha20poly1305",
+    "x25519",
+    "openai"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  }
+}
