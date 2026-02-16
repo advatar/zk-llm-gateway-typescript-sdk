@@ -1,3 +1,6 @@
+# Disabled to save GitHub Actions minutes.
+# Re-enable by renaming this file back to: .github/workflows/ci.yml
+
 name: ci
 
 on:
