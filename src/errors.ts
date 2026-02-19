@@ -11,6 +11,10 @@ export class InvalidGatewayPublicKey extends ZkLlmGatewayError {
   readonly name: string = 'InvalidGatewayPublicKey';
 }
 
+export class Base64Error extends ZkLlmGatewayError {
+  readonly name: string = 'Base64Error';
+}
+
 export class CryptoError extends ZkLlmGatewayError {
   readonly name: string = 'CryptoError';
 }

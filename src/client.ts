@@ -1,6 +1,8 @@
-import { Envelope, GatewayPublicKey, openJson, sealJson } from './crypto.js';
+import * as crypto from 'node:crypto';
+
+import { Envelope, GatewayPublicKey, normalizeEnvelope, openJson, sealJson } from './crypto.js';
 import { GatewayError, HttpError, ProtocolError } from './errors.js';
-import { ChatCompletionsRequest, ChatCompletionsResponse } from './openaiTypes.js';
+import { ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage } from './openaiTypes.js';
 import { TicketSource, ZkTicket } from './tickets.js';
 import { maxOutputTokensHint, TokenClass } from './tokenClass.js';
 
@@ -17,10 +19,78 @@ export interface GatewayClientConfig {
   fetchImpl?: typeof fetch;
 }
 
+interface InferenceRequest {
+  request_id: string;
+  model: string;
+  messages: ChatMessage[];
+  max_tokens?: number;
+  temperature?: number;
+  token_class: TokenClass;
+  ticket: ZkTicket;
+}
+
+interface InferenceResponse {
+  request_id: string;
+  model: string;
+  output: string;
+  billed_token_class: TokenClass;
+}
+
+interface ErrorResponse {
+  code: string;
+  message: string;
+}
+
+type GatewayEnvelopePayload =
+  | { kind: 'ok'; response: InferenceResponse }
+  | { kind: 'err'; error: ErrorResponse };
+
 function joinUrl(base: string, path: string): string {
   const b = base.endsWith('/') ? base : `${base}/`;
   const p = path.startsWith('/') ? path.slice(1) : path;
   return new URL(p, b).toString();
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function parseChatRequest(input: unknown): ChatCompletionsRequest {
+  if (isObject(input) && typeof input.model === 'string' && Array.isArray(input.messages)) {
+    return input as ChatCompletionsRequest;
+  }
+
+  if (isObject(input) && input.path === '/v1/chat/completions' && isObject(input.body)) {
+    return parseChatRequest(input.body);
+  }
+
+  throw new ProtocolError(
+    "unsupported inferJson payload; expected chat request body or {path:'/v1/chat/completions', body:{...}}",
+  );
+}
+
+function buildInferenceRequest(tokenClass: TokenClass, ticket: ZkTicket, req: ChatCompletionsRequest): InferenceRequest {
+  return {
+    request_id: crypto.randomUUID(),
+    model: req.model,
+    messages: req.messages,
+    max_tokens: req.max_tokens,
+    temperature: req.temperature,
+    token_class: tokenClass,
+    ticket,
+  };
+}
+
+function parseGatewayPayload(decrypted: unknown): GatewayEnvelopePayload | undefined {
+  if (!isObject(decrypted)) return undefined;
+  if (decrypted.kind !== 'ok' && decrypted.kind !== 'err') return undefined;
+  if (decrypted.kind === 'ok' && isObject(decrypted.response)) {
+    return { kind: 'ok', response: decrypted.response as unknown as InferenceResponse };
+  }
+  if (decrypted.kind === 'err' && isObject(decrypted.error)) {
+    return { kind: 'err', error: decrypted.error as unknown as ErrorResponse };
+  }
+  return undefined;
 }
 
 export class GatewayClient {
@@ -46,11 +116,12 @@ export class GatewayClient {
   }
 
   async inferJsonWithTicket(tokenClass: TokenClass, ticket: ZkTicket, upstream: unknown): Promise<unknown> {
-    const payload = {
-      token_class: tokenClass,
-      ticket,
-      upstream,
-    };
+    if (ticket.token_class !== tokenClass) {
+      throw new ProtocolError('ticket token_class must match requested token_class');
+    }
+
+    const chatReq = parseChatRequest(upstream);
+    const payload = buildInferenceRequest(tokenClass, ticket, chatReq);
 
     const { envelope, state } = sealJson(this.gatewayPk, tokenClass, payload);
 
@@ -61,7 +132,7 @@ export class GatewayClient {
     };
 
     if (this.config.authBearer) {
-      headers['authorization'] = `Bearer ${this.config.authBearer}`;
+      headers.authorization = `Bearer ${this.config.authBearer}`;
     }
 
     const ctrl = new AbortController();
@@ -90,13 +161,27 @@ export class GatewayClient {
       throw new ProtocolError(`failed to parse envelope (HTTP ${status}): ${snippet}`);
     }
 
-    const respEnv = respJson as Envelope;
+    let respEnv: Envelope;
+    try {
+      respEnv = normalizeEnvelope(respJson as any);
+    } catch (e) {
+      throw new ProtocolError(`invalid encrypted envelope: ${(e as Error).message}`);
+    }
+
     const decrypted = openJson(respEnv, state);
 
-    if (decrypted && typeof decrypted === 'object' && 'error' in (decrypted as any)) {
-      const err = (decrypted as any).error ?? {};
-      const code = String(err.code ?? 'gateway_error');
-      const msg = String(err.message ?? 'unknown error');
+    const payloadOut = parseGatewayPayload(decrypted);
+    if (payloadOut?.kind === 'ok') {
+      return payloadOut.response;
+    }
+    if (payloadOut?.kind === 'err') {
+      throw new GatewayError(payloadOut.error.code ?? 'gateway_error', payloadOut.error.message ?? 'unknown error');
+    }
+
+    // Legacy SDK payload fallback.
+    if (isObject(decrypted) && isObject(decrypted.error)) {
+      const code = String((decrypted.error as any).code ?? 'gateway_error');
+      const msg = String((decrypted.error as any).message ?? 'unknown error');
       throw new GatewayError(code, msg);
     }
 
@@ -104,11 +189,11 @@ export class GatewayClient {
       throw new HttpError(status, `gateway returned HTTP ${status}`);
     }
 
-    if (!decrypted || typeof decrypted !== 'object' || !('upstream' in (decrypted as any))) {
-      throw new ProtocolError("missing 'upstream' field in decrypted gateway response");
+    if (isObject(decrypted) && 'upstream' in decrypted) {
+      return (decrypted as any).upstream;
     }
 
-    return (decrypted as any).upstream;
+    throw new ProtocolError('missing response payload in decrypted gateway response');
   }
 
   async chatCompletions(tokenClass: TokenClass, req: ChatCompletionsRequest): Promise<ChatCompletionsResponse> {
@@ -116,18 +201,30 @@ export class GatewayClient {
       req.max_tokens = maxOutputTokensHint(tokenClass);
     }
 
-    const upstream = {
-      path: '/v1/chat/completions',
-      method: 'POST',
-      body: req,
-    };
+    const respJson = await this.inferJson(tokenClass, req);
 
-    const respJson = await this.inferJson(tokenClass, upstream);
+    if (isObject(respJson) && typeof respJson.output === 'string' && typeof respJson.request_id === 'string') {
+      const ir = respJson as unknown as InferenceResponse;
+      return {
+        id: ir.request_id,
+        model: ir.model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: ir.output,
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        billed_token_class: ir.billed_token_class,
+      } as ChatCompletionsResponse;
+    }
 
-    const body =
-      respJson && typeof respJson === 'object' && 'body' in (respJson as any) ? (respJson as any).body : respJson;
-
-    if (!body || typeof body !== 'object') {
+    // Backward-compatible parsing for SDK-proxy responses.
+    const body = isObject(respJson) && 'body' in respJson ? (respJson as any).body : respJson;
+    if (!isObject(body)) {
       throw new ProtocolError('unexpected upstream response type');
     }
 

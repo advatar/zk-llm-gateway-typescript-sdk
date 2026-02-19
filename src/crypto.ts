@@ -1,8 +1,8 @@
 import * as crypto from 'node:crypto';
 
-import { CryptoError, InvalidGatewayPublicKey, ProtocolError } from './errors.js';
+import { Base64Error, CryptoError, InvalidGatewayPublicKey, ProtocolError } from './errors.js';
 import { padPayload, unpadPayload } from './padding.js';
-import { parseTokenClass, requestPaddedLen, TokenClass } from './tokenClass.js';
+import { parseTokenClass, requestPaddedLen, tokenClassId, TokenClass } from './tokenClass.js';
 
 export interface Envelope {
   /** protocol version */
@@ -19,9 +19,14 @@ export class GatewayPublicKey {
   }
 
   static fromBase64(b64: string): GatewayPublicKey {
-    const raw = Buffer.from(b64.trim(), 'base64');
-    if (raw.length !== 32) throw new InvalidGatewayPublicKey('gateway public key must decode to 32 bytes');
-    return new GatewayPublicKey(raw);
+    try {
+      const raw = Buffer.from(b64.trim(), 'base64');
+      if (raw.length !== 32) throw new InvalidGatewayPublicKey('gateway public key must decode to 32 bytes');
+      return new GatewayPublicKey(raw);
+    } catch (e) {
+      if (e instanceof InvalidGatewayPublicKey) throw e;
+      throw new Base64Error((e as Error).message);
+    }
   }
 
   toBase64(): string {
@@ -32,7 +37,13 @@ export class GatewayPublicKey {
 export interface SealState {
   tokenClass: TokenClass;
   ephPubkey: Uint8Array; // 32 bytes
-  key: Uint8Array; // 32 bytes
+  reqKey: Uint8Array; // 32 bytes
+  respKey: Uint8Array; // 32 bytes
+}
+
+enum KeyDirection {
+  Request = 1,
+  Response = 2,
 }
 
 const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
@@ -53,21 +64,33 @@ function x25519RawFromSpki(spkiDer: Buffer): Uint8Array {
   return spkiDer.subarray(X25519_SPKI_PREFIX.length);
 }
 
-/**
- * Deterministic AAD:
- * [v] + token_class_ascii + '|' + eph_pubkey (32 bytes)
- */
-export function makeAad(v: number, tokenClass: TokenClass, ephPubkey: Uint8Array): Uint8Array {
-  const tc = Buffer.from(tokenClass, 'ascii');
-  const out = Buffer.concat([Buffer.from([v & 0xff]), tc, Buffer.from('|', 'ascii'), Buffer.from(ephPubkey)]);
-  return out;
+export function normalizeEnvelope(input: any): Envelope {
+  const v = input?.v ?? input?.version;
+  const eph = input?.eph_pubkey_b64 ?? input?.kem_pub_b64;
+  if (typeof v !== 'number') throw new ProtocolError('missing envelope version');
+  if (typeof eph !== 'string') throw new ProtocolError('missing eph_pubkey_b64');
+  return {
+    v,
+    token_class: parseTokenClass(String(input?.token_class)),
+    eph_pubkey_b64: eph,
+    nonce_b64: String(input?.nonce_b64 ?? ''),
+    ciphertext_b64: String(input?.ciphertext_b64 ?? ''),
+  };
+}
+
+export function makeAad(v: number, tokenClass: TokenClass, direction: KeyDirection): Uint8Array {
+  return Buffer.from([v & 0xff, tokenClassId(tokenClass) & 0xff, direction & 0xff]);
+}
+
+function hkdfInfo(tokenClass: TokenClass, direction: KeyDirection): Uint8Array {
+  const prefix = Buffer.from('zk-llm-gateway-envelope-v1', 'ascii');
+  const dir = direction === KeyDirection.Request ? Buffer.from('/req', 'ascii') : Buffer.from('/resp', 'ascii');
+  return Buffer.concat([prefix, dir, Buffer.from([tokenClassId(tokenClass) & 0xff])]);
 }
 
 function hkdfSha256(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, len: number): Uint8Array {
-  // HKDF-Extract
   const prk = crypto.createHmac('sha256', Buffer.from(salt)).update(Buffer.from(ikm)).digest();
 
-  // HKDF-Expand
   const blocks: Buffer[] = [];
   let prev = Buffer.alloc(0);
   let counter = 1;
@@ -83,10 +106,9 @@ function hkdfSha256(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, len: nu
   return Buffer.concat(blocks).subarray(0, len);
 }
 
-function deriveKey(sharedSecret: Uint8Array, v: number, tokenClass: TokenClass): Uint8Array {
-  const info = Buffer.from(`zk-llm-gateway|v${v}|${tokenClass}`, 'ascii');
-  const salt = Buffer.alloc(32, 0); // match Rust/Python HKDF(None, ...)
-  return hkdfSha256(sharedSecret, salt, info, 32);
+function deriveKey(sharedSecret: Uint8Array, tokenClass: TokenClass, direction: KeyDirection): Uint8Array {
+  const salt = Buffer.alloc(32, 0);
+  return hkdfSha256(sharedSecret, salt, hkdfInfo(tokenClass, direction), 32);
 }
 
 function chacha20poly1305Encrypt(key: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array, aad?: Uint8Array): Uint8Array {
@@ -125,7 +147,7 @@ function chacha20poly1305Decrypt(key: Uint8Array, nonce: Uint8Array, ciphertextA
 /**
  * Encrypt + pad a JSON payload into an Envelope.
  *
- * Returns (envelope, sealState). Keep sealState to decrypt the response.
+ * Returns `{ envelope, state }`. Keep `state` to decrypt the response.
  */
 export function sealJson(
   gatewayPk: GatewayPublicKey,
@@ -137,7 +159,6 @@ export function sealJson(
   const raw = Buffer.from(JSON.stringify(payload), 'utf8');
   const padded = padPayload(raw, requestPaddedLen(tokenClass));
 
-  // Ephemeral X25519
   const { publicKey: ephPublicKey, privateKey: ephPrivateKey } = crypto.generateKeyPairSync('x25519');
   const ephSpki = ephPublicKey.export({ format: 'der', type: 'spki' }) as Buffer;
   const ephPubRaw = x25519RawFromSpki(ephSpki);
@@ -148,10 +169,12 @@ export function sealJson(
   const shared = crypto.diffieHellman({ privateKey: ephPrivateKey, publicKey: gwPublicKey });
   if (shared.length !== 32) throw new CryptoError('unexpected x25519 shared secret length');
 
-  const key = deriveKey(shared, v, tokenClass);
+  const reqKey = deriveKey(shared, tokenClass, KeyDirection.Request);
+  const respKey = deriveKey(shared, tokenClass, KeyDirection.Response);
+
   const nonce = crypto.randomBytes(12);
-  const aad = makeAad(v, tokenClass, ephPubRaw);
-  const ct = chacha20poly1305Encrypt(key, nonce, padded, aad);
+  const aad = makeAad(v, tokenClass, KeyDirection.Request);
+  const ct = chacha20poly1305Encrypt(reqKey, nonce, padded, aad);
 
   const envelope: Envelope = {
     v,
@@ -164,19 +187,19 @@ export function sealJson(
   const state: SealState = {
     tokenClass,
     ephPubkey: ephPubRaw,
-    key,
+    reqKey,
+    respKey,
   };
 
   return { envelope, state };
 }
 
-/** Decrypt an Envelope using the SealState from the request. */
-export function openJson(envelope: Envelope, state: SealState): unknown {
-  if (envelope.v !== 1) throw new CryptoError('unsupported envelope version');
+/** Decrypt an Envelope response using the SealState from the request. */
+export function openJson(input: Envelope, state: SealState): unknown {
+  const envelope = normalizeEnvelope(input);
 
-  // Normalize token class (string) to enum
-  const envTc = parseTokenClass(String(envelope.token_class));
-  if (envTc !== state.tokenClass) throw new CryptoError('token_class mismatch');
+  if (envelope.v !== 1) throw new CryptoError('unsupported envelope version');
+  if (envelope.token_class !== state.tokenClass) throw new CryptoError('token_class mismatch');
 
   const ephPub = Buffer.from(String(envelope.eph_pubkey_b64).trim(), 'base64');
   const nonce = Buffer.from(String(envelope.nonce_b64).trim(), 'base64');
@@ -184,11 +207,10 @@ export function openJson(envelope: Envelope, state: SealState): unknown {
 
   if (ephPub.length !== 32 || nonce.length !== 12) throw new CryptoError('invalid envelope fields');
 
-  // Expect gateway to echo the eph_pubkey from request.
   if (!Buffer.from(state.ephPubkey).equals(ephPub)) throw new CryptoError('unexpected eph_pubkey in response');
 
-  const aad = makeAad(envelope.v, envTc, ephPub);
-  const padded = chacha20poly1305Decrypt(state.key, nonce, ct, aad);
+  const aad = makeAad(envelope.v, envelope.token_class, KeyDirection.Response);
+  const padded = chacha20poly1305Decrypt(state.respKey, nonce, ct, aad);
   const raw = unpadPayload(padded);
 
   try {
