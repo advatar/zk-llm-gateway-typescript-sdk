@@ -18,8 +18,10 @@ export interface ChatCompletionsRequest {
   temperature?: number;
   max_tokens?: number;
   stream?: boolean;
-  /** Extra OpenAI-compatible fields forwarded to the upstream provider. */
-  /** `stream=true` is rejected on `/v1/infer`, which remains non-streaming today. */
+  /**
+   * Extra OpenAI-compatible fields forwarded to the upstream provider.
+   * `stream=true` is rejected on `/v1/infer`, which remains non-streaming today.
+   */
   [key: string]: unknown;
 }
 
