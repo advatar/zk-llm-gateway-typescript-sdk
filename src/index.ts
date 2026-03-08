@@ -6,3 +6,4 @@ export * from './tickets.js';
 export * from './openaiTypes.js';
 export * from './redaction.js';
 export * from './client.js';
+export * from './integration.js';

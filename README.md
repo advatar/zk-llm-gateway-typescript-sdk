@@ -66,6 +66,38 @@ const resp = await client.chatCompletions(TokenClass.C2048, {
 console.log(resp.choices?.[0]?.message?.content ?? '');
 ```
 
+## Drop-in app wrapper
+
+If your Node app wants an env-driven integration layer instead of wiring
+`GatewayClient` manually, use `AppGatewayConfig`.
+
+Environment variables:
+
+- `GATEWAY_BASE_URL` or `GATEWAY_URL` - base URL for the gateway or relay host
+- `GATEWAY_PUBLIC_KEY_B64` - base64 X25519 gateway public key
+- `GATEWAY_TICKETS_JSON` or `TICKETS_JSON` - JSON file containing pre-issued tickets
+- `GATEWAY_USE_DUMMY_TICKETS=true` - development-only fallback
+- `GATEWAY_INFER_PATH=/relay` or `GATEWAY_USE_RELAY=true` - send ciphertext through the relay
+- `GATEWAY_MODEL` or `MODEL` - default model name, defaults to `gpt-4o-mini`
+- `GATEWAY_TOKEN_CLASS` or `TOKEN_CLASS` - defaults to `c2048`
+- `GATEWAY_TEMPERATURE` - optional default temperature
+- `GATEWAY_TIMEOUT_SECS` - optional request timeout, defaults to `60`
+- `GATEWAY_AUTH_BEARER` - optional bearer token
+
+```ts
+import { AppGatewayConfig } from 'zk-llm-gateway-sdk';
+
+const gateway = await AppGatewayConfig.fromEnv().build();
+const answer = await gateway.askWithSystem(
+  'You are a helpful assistant.',
+  'Summarize our privacy model.',
+);
+
+console.log(answer);
+```
+
+For a complete executable example, see `examples/app_gateway.ts`.
+
 ## Ticket sources
 
 ### Dummy tickets (dev only)

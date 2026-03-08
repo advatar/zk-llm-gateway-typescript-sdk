@@ -3,6 +3,7 @@ export type ChatRole = 'system' | 'user' | 'assistant' | (string & {});
 export interface ChatMessage {
   role: ChatRole;
   content: string;
+  [key: string]: unknown;
 }
 
 export const ChatMessage = {
@@ -18,6 +19,7 @@ export interface ChatCompletionsRequest {
   max_tokens?: number;
   stream?: boolean;
   /** Extra OpenAI-compatible fields forwarded to the upstream provider. */
+  /** `stream=true` is rejected on `/v1/infer`, which remains non-streaming today. */
   [key: string]: unknown;
 }
 

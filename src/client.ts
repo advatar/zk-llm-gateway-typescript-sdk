@@ -19,21 +19,18 @@ export interface GatewayClientConfig {
   fetchImpl?: typeof fetch;
 }
 
-interface InferenceRequest {
+type InferenceRequest = ChatCompletionsRequest & {
   request_id: string;
-  model: string;
-  messages: ChatMessage[];
-  max_tokens?: number;
-  temperature?: number;
   token_class: TokenClass;
   ticket: ZkTicket;
-}
+};
 
 interface InferenceResponse {
   request_id: string;
   model: string;
   output: string;
   billed_token_class: TokenClass;
+  upstream?: unknown;
 }
 
 interface ErrorResponse {
@@ -70,12 +67,13 @@ function parseChatRequest(input: unknown): ChatCompletionsRequest {
 }
 
 function buildInferenceRequest(tokenClass: TokenClass, ticket: ZkTicket, req: ChatCompletionsRequest): InferenceRequest {
+  if (req.stream === true) {
+    throw new ProtocolError('stream=true is not supported on /v1/infer');
+  }
+
   return {
+    ...req,
     request_id: crypto.randomUUID(),
-    model: req.model,
-    messages: req.messages,
-    max_tokens: req.max_tokens,
-    temperature: req.temperature,
     token_class: tokenClass,
     ticket,
   };
@@ -205,6 +203,18 @@ export class GatewayClient {
 
     if (isObject(respJson) && typeof respJson.output === 'string' && typeof respJson.request_id === 'string') {
       const ir = respJson as unknown as InferenceResponse;
+      if (isObject(ir.upstream)) {
+        const body = isObject(ir.upstream) && 'body' in ir.upstream ? (ir.upstream as any).body : ir.upstream;
+        if (isObject(body)) {
+          return {
+            ...body,
+            id: typeof (body as any).id === 'string' ? (body as any).id : ir.request_id,
+            model: typeof (body as any).model === 'string' ? (body as any).model : ir.model,
+            billed_token_class: ir.billed_token_class,
+          } as unknown as ChatCompletionsResponse;
+        }
+      }
+
       return {
         id: ir.request_id,
         model: ir.model,
@@ -219,7 +229,7 @@ export class GatewayClient {
           },
         ],
         billed_token_class: ir.billed_token_class,
-      } as ChatCompletionsResponse;
+      } as unknown as ChatCompletionsResponse;
     }
 
     // Backward-compatible parsing for SDK-proxy responses.
